@@ -10,8 +10,9 @@
 #
 # Auth: a `user_session` cookie value (grants full account access — treat like a
 # password). Resolution order: --token > GH_SESSION_TOKEN env > `gh config get
-# -h github.com gh-assets.token`. Get one from a logged-in browser:
-#   DevTools → Application → Cookies → github.com → user_session → Value.
+# -h github.com gh-assets.token` > local browser cookie store (Firefox/Chromium
+# family; set GH_ASSETS_NO_BROWSER=1 to skip). On a headless/remote host there is
+# no browser cookie — use GH_SESSION_TOKEN.
 #
 set -euo pipefail
 
@@ -41,6 +42,8 @@ AUTH (first match wins)
   1. --token <value>
   2. GH_SESSION_TOKEN environment variable
   3. gh config get -h github.com gh-assets.token
+  4. local browser cookie store (Firefox/Chrome/Brave/Edge; no config needed)
+     — set GH_ASSETS_NO_BROWSER=1 to skip; unavailable on headless hosts.
 
 EXAMPLES
   gh assets upload screenshot.png
@@ -60,7 +63,125 @@ resolve_token() {
   local cfg
   cfg=$(gh config get -h github.com gh-assets.token 2>/dev/null || true)
   [ -n "$cfg" ] && { printf '%s' "$cfg"; return; }
-  die "no session token — pass --token, set GH_SESSION_TOKEN, or run: gh config set -h github.com gh-assets.token <value>"
+  # Zero-config fallback: read the github.com user_session straight from a local
+  # browser (like gh-image). Disable with GH_ASSETS_NO_BROWSER=1.
+  if [ -z "${GH_ASSETS_NO_BROWSER:-}" ]; then
+    local br; br=$(browser_cookie 2>/dev/null || true)
+    [ -n "$br" ] && { printf '%s' "$br"; return; }
+  fi
+  die "no session token — pass --token, set GH_SESSION_TOKEN, run \`gh config set -h github.com gh-assets.token <value>\`, or log into github.com in a local browser (Firefox/Chrome/Brave/Edge). On a headless/remote host, no browser cookie exists — use GH_SESSION_TOKEN."
+}
+
+# browser_cookie prints the github.com user_session value from a local browser,
+# trying Firefox (plaintext) first, then the Chromium family (encrypted).
+browser_cookie() {
+  local v
+  v=$(firefox_cookie) && [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  v=$(chromium_cookie) && [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  return 1
+}
+
+# Firefox stores cookies unencrypted in moz_cookies. Copy the DB first — the
+# live file is often WAL-locked while the browser runs.
+firefox_cookie() {
+  command -v sqlite3 >/dev/null || return 1
+  local db tmp v
+  for db in "$HOME"/.mozilla/firefox/*.default*/cookies.sqlite \
+            "$HOME"/snap/firefox/common/.mozilla/firefox/*.default*/cookies.sqlite \
+            "$HOME"/.var/app/org.mozilla.firefox/.mozilla/firefox/*.default*/cookies.sqlite; do
+    [ -f "$db" ] || continue
+    tmp=$(mktemp) || return 1
+    cp "$db" "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+    v=$(sqlite3 "$tmp" "SELECT value FROM moz_cookies WHERE host LIKE '%github.com' AND name='user_session' ORDER BY LENGTH(value) DESC LIMIT 1;" 2>/dev/null)
+    rm -f "$tmp"
+    [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  done
+  return 1
+}
+
+# Chromium-family cookies are AES-128-CBC encrypted. The key is PBKDF2(pw,
+# "saltysalt", 1, 16) where pw is the keyring "Safe Storage" secret (v11) or the
+# literal "peanuts" (v10). Newer builds prepend a 32-byte domain hash to the
+# plaintext. Requires python3 + the `cryptography` package.
+chromium_cookie() {
+  command -v python3 >/dev/null || return 1
+  python3 - <<'PY'
+import glob, os, sqlite3, shutil, tempfile, subprocess, hashlib, sys
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except Exception:
+    sys.exit(1)
+
+home = os.path.expanduser("~")
+# (config subdir, keyring application label)
+browsers = [
+    ("google-chrome", "chrome"),
+    ("chromium", "chromium"),
+    ("BraveSoftware/Brave-Browser", "brave"),
+    ("microsoft-edge", "chromium"),
+]
+
+def keyring_pw(app):
+    if not shutil.which("secret-tool"):
+        return None
+    for args in (["application", app], ["application", "chrome"], ["application", "chromium"]):
+        try:
+            out = subprocess.run(["secret-tool", "lookup", *args],
+                                 capture_output=True, timeout=5)
+            if out.returncode == 0 and out.stdout:
+                return out.stdout  # bytes, no trailing newline from secret-tool
+        except Exception:
+            pass
+    return None
+
+def derive(pw):
+    return hashlib.pbkdf2_hmac("sha1", pw, b"saltysalt", 1, 16)
+
+def decrypt(blob, app):
+    ver, enc = blob[:3], blob[3:]
+    pw = b"peanuts" if ver == b"v10" else (keyring_pw(app) or b"peanuts")
+    key = derive(pw)
+    d = Cipher(algorithms.AES(key), modes.CBC(b" " * 16)).decryptor()
+    data = d.update(enc) + d.finalize()
+    if data:                       # strip PKCS7 padding
+        data = data[:-data[-1]]
+    for candidate in (data, data[32:]):   # newer builds prepend a 32-byte hash
+        try:
+            s = candidate.decode("utf-8")
+            if s.strip():
+                return s
+        except Exception:
+            continue
+    return None
+
+for sub, app in browsers:
+    base = os.path.join(home, ".config", sub)
+    for db in glob.glob(os.path.join(base, "*", "Cookies")):  # Default + named profiles
+        if not os.path.isfile(db):
+            continue
+        tmp = tempfile.mktemp()
+        try:
+            shutil.copy(db, tmp)
+            con = sqlite3.connect(tmp)
+            rows = con.execute(
+                "SELECT encrypted_value FROM cookies WHERE host_key LIKE '%github.com' "
+                "AND name='user_session' ORDER BY LENGTH(encrypted_value) DESC"
+            ).fetchall()
+            con.close()
+        except Exception:
+            rows = []
+        finally:
+            try: os.remove(tmp)
+            except OSError: pass
+        for (blob,) in rows:
+            if not blob:
+                continue
+            val = decrypt(bytes(blob), app)
+            if val:
+                sys.stdout.write(val)
+                sys.exit(0)
+sys.exit(1)
+PY
 }
 
 # GitHub requires user_session AND __Host-user_session_same_site (same value)

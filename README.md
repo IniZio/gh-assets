@@ -77,9 +77,22 @@ order — first match wins:
 | 1 | `--token <value>` flag | one-off (visible in `ps` — avoid on shared hosts) |
 | 2 | `GH_SESSION_TOKEN` env var | CI / headless / preferred locally |
 | 3 | `gh config get -h github.com gh-assets.token` | persistent local default |
+| 4 | **local browser cookie store** | zero-config local use (default) |
 
-Get the value from a logged-in browser: **DevTools → Application → Cookies →
-`github.com` → `user_session` → Value**. Store it once:
+**Zero-config (like gh-image):** if nothing above is set, `gh-assets` reads the
+`github.com` `user_session` straight from your browser — **Firefox** (plaintext
+`cookies.sqlite`) or the **Chromium family** (Chrome/Brave/Edge; AES-decrypted
+via the GNOME keyring, needs `python3`+`cryptography` and `secret-tool`). Set
+`GH_ASSETS_NO_BROWSER=1` to disable.
+
+> [!NOTE]
+> Browser extraction only works where the browser lives. On a **headless or
+> remote dev host** there is no cookie store — set `GH_SESSION_TOKEN` (or store
+> it in `gh config`) instead.
+
+To set a token explicitly, get the value from a logged-in browser (**DevTools →
+Application → Cookies → `github.com` → `user_session` → Value**) and store it
+once:
 
 ```bash
 gh config set -h github.com gh-assets.token "<user_session-value>"
