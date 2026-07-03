@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+#
+# gh-assets — upload files to GitHub's user-attachments store from the CLI and
+# print a ready-to-paste markdown reference. Images embed inline, videos render
+# as players, everything else becomes a download link — the same output GitHub
+# produces on web drag-and-drop, with the same repo-scoped visibility.
+#
+# GitHub has no public API for attachment uploads; this replays the four-step
+# browser flow (uploadToken → policy → S3 → finalize) that the web UI uses.
+#
+# Auth: a `user_session` cookie value (grants full account access — treat like a
+# password). Resolution order: --token > GH_SESSION_TOKEN env > `gh config get
+# -h github.com gh-assets.token`. Get one from a logged-in browser:
+#   DevTools → Application → Cookies → github.com → user_session → Value.
+#
+set -euo pipefail
+
+UA="Mozilla/5.0 (gh-assets)"
+GH_BASE="https://github.com"
+
+die() { printf 'gh-assets: %s\n' "$*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+usage() {
+  cat >&2 <<'EOF'
+Upload files to GitHub user-attachments and print markdown references.
+
+USAGE
+  gh assets upload <file>... [--repo owner/repo] [--token <user_session>]
+  gh assets check-token       [--token <user_session>]
+  gh assets --help
+
+OPTIONS
+  --repo owner/repo   Target repo for visibility scoping. Default: inferred from
+                      the current git workspace (gh repo view).
+  --token <value>     user_session cookie value. Overrides GH_SESSION_TOKEN and
+                      stored config. Visible in `ps` — prefer the env var.
+
+AUTH (first match wins)
+  1. --token <value>
+  2. GH_SESSION_TOKEN environment variable
+  3. gh config get -h github.com gh-assets.token
+
+EXAMPLES
+  gh assets upload screenshot.png
+  gh assets upload before.png after.png diagram.svg --repo oursky/hanlun-lms
+  BODY="Repro:
+
+$(gh assets upload bug.png)"; gh issue create --body "$BODY"
+EOF
+}
+
+# ---- auth ---------------------------------------------------------------------
+
+resolve_token() {
+  local flag="${1:-}"
+  if [ -n "$flag" ]; then printf '%s' "$flag"; return; fi
+  if [ -n "${GH_SESSION_TOKEN:-}" ]; then printf '%s' "$GH_SESSION_TOKEN"; return; fi
+  local cfg
+  cfg=$(gh config get -h github.com gh-assets.token 2>/dev/null || true)
+  [ -n "$cfg" ] && { printf '%s' "$cfg"; return; }
+  die "no session token — pass --token, set GH_SESSION_TOKEN, or run: gh config set -h github.com gh-assets.token <value>"
+}
+
+# GitHub requires user_session AND __Host-user_session_same_site (same value)
+# for CSRF validation on the upload endpoints.
+cookie_header() { printf 'user_session=%s; __Host-user_session_same_site=%s' "$1" "$1"; }
+
+# ---- helpers ------------------------------------------------------------------
+
+# content_type expected by GitHub's allowlist. `file` disagrees on a few
+# extensions GitHub validates strictly (e.g. .log → text/x-log), so map those.
+content_type_for() {
+  local f="$1" ext
+  ext=$(printf '%s' "${f##*.}" | tr '[:upper:]' '[:lower:]')
+  case "$ext" in
+    png) echo image/png ;;
+    jpg|jpeg) echo image/jpeg ;;
+    gif) echo image/gif ;;
+    webp) echo image/webp ;;
+    svg) echo image/svg+xml ;;
+    mp4) echo video/mp4 ;;
+    mov) echo video/quicktime ;;
+    webm) echo video/webm ;;
+    pdf) echo application/pdf ;;
+    zip) echo application/zip ;;
+    log) echo text/x-log ;;
+    txt) echo text/plain ;;
+    *)
+      if command -v file >/dev/null 2>&1; then
+        file --mime-type -b "$f" 2>/dev/null || echo application/octet-stream
+      else
+        echo application/octet-stream
+      fi
+      ;;
+  esac
+}
+
+render_markdown() {
+  local name="$1" href="$2" ct="$3"
+  case "$ct" in
+    image/*) printf '![%s](%s)\n' "$name" "$href" ;;
+    video/*) printf '%s\n' "$href" ;;          # bare URL → inline <video> player
+    *)       printf '[%s](%s)\n' "$name" "$href" ;;
+  esac
+}
+
+# POST/PUT/GET returning "<body>\n<http_code>"; body may contain newlines.
+http() {  # http METHOD URL [curl-args...]
+  local method="$1" url="$2"; shift 2
+  curl -sS -X "$method" -H "User-Agent: $UA" -w $'\n%{http_code}' "$@" "$url"
+}
+
+split_code() { CODE="${1##*$'\n'}"; BODY="${1%$'\n'*}"; }
+
+# ---- core: one file -----------------------------------------------------------
+
+upload_one() {
+  local token="$1" owner="$2" repo="$3" repo_id="$4" path="$5"
+  [ -f "$path" ] || die "no such file: $path"
+
+  local name size ct cookie resp
+  name=$(basename "$path")
+  size=$(wc -c <"$path" | tr -d ' ')
+  ct=$(content_type_for "$path")
+  cookie=$(cookie_header "$token")
+
+  # Step 0 — uploadToken from the repo page.
+  resp=$(http GET "$GH_BASE/$owner/$repo" -H "Cookie: $cookie"); split_code "$resp"
+  [ "$CODE" = 200 ] || die "cannot read $owner/$repo page (HTTP $CODE) — check token/access"
+  local upload_token
+  upload_token=$(printf '%s' "$BODY" | grep -oE '"uploadToken":"[^"]+"' | head -1 | sed 's/.*:"//;s/"$//')
+  [ -n "$upload_token" ] || die "uploadToken not found — need write access to $owner/$repo (or authorize SAML SSO)"
+
+  # Step 1 — request the S3 upload policy.
+  resp=$(http POST "$GH_BASE/upload/policies/assets" \
+    -H "Cookie: $cookie" -H "Accept: application/json" \
+    -H "Origin: $GH_BASE" -H "Referer: $GH_BASE/$owner/$repo" \
+    -H "X-Requested-With: XMLHttpRequest" \
+    -F "name=$name" -F "size=$size" -F "content_type=$ct" \
+    -F "authenticity_token=$upload_token" -F "repository_id=$repo_id"); split_code "$resp"
+  [ "$CODE" = 201 ] || die "policy request failed (HTTP $CODE): $(printf '%s' "$BODY" | head -c 300)"
+
+  local policy="$BODY" upload_url asset_url asset_token asset_ct
+  upload_url=$(jq -r '.upload_url' <<<"$policy")
+  asset_url=$(jq -r '.asset_upload_url' <<<"$policy")
+  asset_token=$(jq -r '.asset_upload_authenticity_token' <<<"$policy")
+  asset_ct=$(jq -r '.asset.content_type // empty' <<<"$policy")
+  [ -n "$asset_ct" ] && ct="$asset_ct"
+  [ "$upload_url" != null ] && [ -n "$asset_url" ] && [ "$asset_url" != null ] \
+    || die "malformed policy response"
+
+  # Step 2 — POST the file to S3. Form fields first (order matters for the
+  # presigned signature), file last, no GitHub cookies.
+  local -a s3=()
+  local k v
+  for k in key acl policy X-Amz-Algorithm X-Amz-Credential X-Amz-Date \
+           X-Amz-Signature Content-Type Cache-Control x-amz-meta-Surrogate-Control; do
+    v=$(jq -r --arg k "$k" '.form[$k] // empty' <<<"$policy")
+    [ -n "$v" ] && s3+=(-F "$k=$v")
+  done
+  s3+=(-F "file=@$path;type=$ct")
+  resp=$(http POST "$upload_url" -H "Origin: $GH_BASE" "${s3[@]}"); split_code "$resp"
+  case "$CODE" in 200|201|204) ;; *) die "S3 upload failed (HTTP $CODE): $(printf '%s' "$BODY" | head -c 300)";; esac
+
+  # Step 3 — finalize; response carries the canonical href.
+  resp=$(http PUT "$GH_BASE$asset_url" \
+    -H "Cookie: $cookie" -H "Accept: application/json" \
+    -H "Origin: $GH_BASE" -H "Referer: $GH_BASE/$owner/$repo" \
+    -H "X-Requested-With: XMLHttpRequest" \
+    -F "authenticity_token=$asset_token"); split_code "$resp"
+  [ "$CODE" = 200 ] || die "finalize failed (HTTP $CODE): $(printf '%s' "$BODY" | head -c 300)"
+
+  local href fname
+  href=$(jq -r '.href' <<<"$BODY")
+  fname=$(jq -r '.name // empty' <<<"$BODY"); [ -n "$fname" ] || fname="$name"
+  [ "$href" != null ] && [ -n "$href" ] || die "finalize response missing href"
+
+  render_markdown "$fname" "$href" "$ct"
+}
+
+# ---- subcommands --------------------------------------------------------------
+
+infer_repo() { gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true; }
+
+cmd_upload() {
+  local token_flag="" repo="" ; local -a files=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --token) token_flag="${2:-}"; shift 2 ;;
+      --repo)  repo="${2:-}"; shift 2 ;;
+      --help|-h) usage; exit 0 ;;
+      --) shift; while [ $# -gt 0 ]; do files+=("$1"); shift; done ;;
+      -*) die "unknown flag: $1" ;;
+      *) files+=("$1"); shift ;;
+    esac
+  done
+  [ "${#files[@]}" -gt 0 ] || die "no files given (see: gh assets --help)"
+
+  local token; token=$(resolve_token "$token_flag")
+  [ -n "$repo" ] || repo=$(infer_repo)
+  [ -n "$repo" ] || die "no repo — pass --repo owner/repo or run inside a git workspace"
+  local owner="${repo%%/*}" name="${repo##*/}"
+  local repo_id; repo_id=$(gh api "repos/$owner/$name" --jq .id 2>/dev/null) \
+    || die "cannot resolve repository id for $repo"
+
+  local rc=0 f
+  for f in "${files[@]}"; do
+    if ! upload_one "$token" "$owner" "$name" "$repo_id" "$f"; then rc=1; fi
+  done
+  return $rc
+}
+
+# Validate a token; prints the authenticated login on success (exit 0).
+cmd_check_token() {
+  local token_flag=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --token) token_flag="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac; done
+  local token; token=$(resolve_token "$token_flag")
+  local resp; resp=$(curl -sS -H "User-Agent: $UA" -H "Cookie: $(cookie_header "$token")" \
+    -w $'\n%{http_code}' -o - "$GH_BASE/settings/profile"); split_code "$resp"
+  [ "$CODE" = 200 ] || die "token invalid or expired (HTTP $CODE)"
+  printf '%s' "$BODY" | grep -oE '<meta name="user-login" content="[^"]+"' \
+    | head -1 | sed 's/.*content="//;s/"$//'
+}
+
+# ---- dispatch -----------------------------------------------------------------
+
+need curl; need jq; need gh
+sub="${1:-}"; [ $# -gt 0 ] && shift || true
+case "$sub" in
+  upload)         cmd_upload "$@" ;;
+  check-token)    cmd_check_token "$@" ;;
+  ""|--help|-h)   usage ;;
+  *) die "unknown command: $sub (see: gh assets --help)" ;;
+esac
