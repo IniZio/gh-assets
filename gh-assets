@@ -145,13 +145,19 @@ def decrypt(blob, app):
     data = d.update(enc) + d.finalize()
     if data:                       # strip PKCS7 padding
         data = data[:-data[-1]]
-    for candidate in (data, data[32:]):   # newer builds prepend a 32-byte hash
+    # Newer builds prepend a 32-byte SHA256 domain hash to the plaintext. Those
+    # bytes are binary; a github.com user_session is printable ASCII. So accept
+    # the first candidate that is entirely printable ASCII — trying the
+    # unstripped value first means we never over-strip a genuine short cookie.
+    def printable_ascii(s):
+        return bool(s) and all(32 <= ord(c) < 127 for c in s)
+    for candidate in (data, data[32:]):
         try:
             s = candidate.decode("utf-8")
-            if s.strip():
-                return s
         except Exception:
             continue
+        if printable_ascii(s):
+            return s
     return None
 
 for sub, app in browsers:
